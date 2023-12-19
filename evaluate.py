@@ -18,123 +18,122 @@ from torch.utils.data import DataLoader, SubsetRandomSampler
 from torch.utils.data.dataset import Dataset
 from torchsummary import summary
 import numpy as np
+from ResNet import ResNet
+from ContrastiveLoss import ContrastiveLoss
+from SimCLRDataset import SimCLRDataset
 from hyperParams import hyperParams
+from SimCLRModel import SimCLRModel
 import matplotlib.pyplot as plt
 from utils import extract_features
-from RotNetDataset import RotatedCIFAR10
-from RotNetLoss import RotNetLoss
-from RotNet import RotNet
-
 
 # Data Augmentation
 data_transform = transforms.Compose([
-    # transforms.Resize(224),
-    # transforms.ColorJitter(brightness=0.5, contrast=1, saturation=0.1, hue=0.5),
-    # transforms.GaussianBlur(kernel_size=(7, 13), sigma=(9, 11)),
+    # transforms.Resize(224)
     transforms.ToTensor()
 ])
 
 hyperparams = hyperParams()
-root = "./data"  # Change this to your desired data directory
-dataset = RotatedCIFAR10(root=root, transform=data_transform)
-indices = list(range(len(dataset)))
-device = 'cuda' if torch.cuda.is_available else 'cpu'
+dataset = datasets.CIFAR10(root='./data', download=True, train=False, transform=data_transform)
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-subset_labeled_size = 640
-subset_labeled_indices = indices[:subset_labeled_size]
-subset_labeled_sampler = SubsetRandomSampler(subset_labeled_indices)
-labeled_dataloader = DataLoader(dataset=dataset, batch_size=hyperparams.batch_size, sampler=subset_labeled_sampler)
+train_set, test_set = torch.utils.data.random_split(dataset, [int(len(dataset) * .8), int(len(dataset) * .2)])
+train_dataloader = DataLoader(dataset=train_set, batch_size=hyperparams.batch_size, shuffle=True)
 
 print("Extracting Features...")
-rotnet_encoder = RotNet(torch.hub.load('pytorch/vision:v0.9.0', 'resnet50', pretrained=True).to(device), hyperparams.num_classes)
-rotnet_encoder.load_state_dict(torch.load('rotnet_encoder256.pth', map_location=torch.device('cuda'))['state_dict'])
-rotnet_encoder.to(device)
-rotnet_encoder.rotation_head = nn.Identity()
-features, labels = extract_features(labeled_dataloader, rotnet_encoder)
+simclr_model = SimCLRModel(torch.hub.load('pytorch/vision:v0.9.0', 'resnet50', pretrained=False).to(device))
+simclr_model.load_state_dict(torch.load('simclr_encoder.pth', map_location=torch.device('cuda'))['state_dict'])
+simclr_encoder = simclr_model.encoder
+simclr_encoder.projection_head = nn.Identity()
+linearClassifier = nn.Linear(1000, hyperparams.num_classes).to(device)
 
 # Step 3: Linear classifier
 # Train a linear classifier (logistic regression in this example)
-linear_classifier = nn.Linear(features.size(1), hyperparams.num_classes).to(device)
 criterion = nn.CrossEntropyLoss()
-optimizer = optim.SGD(linear_classifier.parameters(), lr=0.01)
+optimizer = optim.SGD(linearClassifier.parameters(), lr=0.01)
 
+simclr_model.eval()
 print("Training Linear Classifier...")
 # Train the linear classifier
-num_epochs = 1000
-for epoch in tqdm(range(num_epochs)):
-    outputs = linear_classifier(features)
-    targets = F.one_hot(labels, hyperparams.num_classes).float().to(device)
-    loss = criterion(outputs, targets)
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
+num_epochs = 10
+for epoch in range(num_epochs):
+    for batch in tqdm(train_dataloader):
+        inputs, labels = batch
+        inputs = inputs.to(device)
+        labels = labels.to(device)
+        features = simclr_encoder(inputs)
+        outputs = linearClassifier(features)
+        loss = criterion(outputs, labels)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+    print(f"loss: {loss.item()}")
     
-# Fine-Tuning RotNet
-print("Finetuning RotNet...")
+# Fine-Tuning SimCLR
+print("Finetuning SimCLR...")
 finetune_data_transform = transforms.Compose([
-    # transforms.Resize(224),
-    # transforms.ColorJitter(brightness=0.5, contrast=1, saturation=0.1, hue=0.5),
     # transforms.RandomHorizontalFlip(p=0.5),
     transforms.ToTensor()
 ])
-finetune_dataset = dataset
 
 # Define the labeling fraction for fine-tuning
-labeling_fraction = 0.1  # Example: 10% of the dataset is labeled
+labeling_fraction = hyperparams.labeling_fraction # Example: 10% of the dataset is labeled
+finetune_dataset = datasets.CIFAR10(root='./data', download=True, train=False, transform=finetune_data_transform)
+
+
 if labeling_fraction > 0:
     # Split dataset into labeled and unlabeled subsets
     num_total_samples = len(finetune_dataset)
     num_labeled_samples = int(labeling_fraction * num_total_samples)
-    labeled_subset, unlabeled_subset = torch.utils.data.random_split(finetune_dataset, [num_labeled_samples, num_total_samples - num_labeled_samples])
+    labeled_subset, unlabeled_subset = torch.utils.data.random_split(finetune_dataset, [num_labeled_samples, num_total_samples -  num_labeled_samples])
 
     # DataLoader for labeled and unlabeled subsets
-    labeled_data_loader = DataLoader(labeled_subset, batch_size=hyperparams.batch_size, shuffle=True)
-    unlabeled_data_loader = DataLoader(unlabeled_subset, batch_size=hyperparams.batch_size, shuffle=True)
+    labeled_dataloader = DataLoader(labeled_subset, batch_size=hyperparams.batch_size, shuffle=True)
 
-    optimizer_finetune = optim.SGD(rotnet_encoder.parameters(), lr=0.05 * hyperparams.batch_size / 256, momentum=0.9, nesterov=True)
+    optimizer_finetune = optim.SGD(simclr_encoder.parameters(), lr=0.05 * hyperparams.batch_size / 256, momentum=0.9, nesterov=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     criterion = nn.CrossEntropyLoss()
 
     num_epochs_finetune = 60 if labeling_fraction == 0.01 else 30
     
-    rotnet_encoder.train()
+    simclr_model.train()
 
     for epoch in tqdm(range(num_epochs_finetune)):
-        for batch in labeled_data_loader:
+        for batch in labeled_dataloader:
             finetune_inputs, finetune_labels = batch
             finetune_inputs = finetune_inputs.to(device)
             finetune_labels = finetune_labels.to(device)
 
             # Forward pass with SimCLR encoder
-            features, labels = extract_features(labeled_dataloader, rotnet_encoder)
-
-            # Fine-tuning: replace this part with your downstream task-specific head
-            finetune_predictions = linear_classifier(features)
-            targets = F.one_hot(finetune_labels, hyperparams.num_classes).float().to(device)
-            # Compute supervised loss
-            finetune_loss = criterion(finetune_predictions, labels)
+            features = simclr_encoder(finetune_inputs)
+            outputs = linearClassifier(features)
+            loss = criterion(outputs, finetune_labels)
 
             # Backward pass and optimization
             optimizer_finetune.zero_grad()
-            finetune_loss.backward()
+            loss.backward()
             optimizer_finetune.step()
 
     
 # Step 4: Evaluation
 # Evaluate the linear classifier on a test set
-rotnet_encoder.eval()
-subset_test_size = 640
-subset_test_indices = indices[:subset_test_size]
-subset_test_sampler = SubsetRandomSampler(subset_test_indices)
-test_dataloader = DataLoader(dataset=dataset, batch_size=hyperparams.batch_size, sampler=subset_test_sampler)
-test_features, test_labels = extract_features(test_dataloader, rotnet_encoder)
+test_dataloader = DataLoader(dataset=test_set, batch_size=hyperparams.batch_size, shuffle=True)
 
 print("Evaluating with Linear Classifier...")
-linear_classifier.eval()
+top1 = []
+top5 = []
+simclr_encoder.eval()
 with torch.no_grad():
-    test_outputs = linear_classifier(test_features)
-    _, predicted = torch.max(test_outputs, 1)
-    print(predicted.shape)
-    print(test_outputs.shape)
-    top1accuracy = (predicted == test_labels).float().mean().item()
-    print(f"Linear Classifier Top-1 Accuracy: {top1accuracy * 100:.2f}%")
+    for batch in test_dataloader:
+        inputs, labels = batch
+        inputs = inputs.to(device)
+        labels = labels.to(device)
+        features = simclr_encoder(inputs)
+        outputs = linearClassifier(features)
+        _, predicted = torch.max(outputs, 1)
+        top5guesses = torch.topk(outputs, k=5, dim=1).indices
+        top5accuracy = torch.sum(torch.Tensor([labels[i] in top5guesses[i] for i in range(len(labels))])).item()/len(labels)
+        top1accuracy = (predicted == labels).float().mean().item()
+        top5.append(top5accuracy)
+        top1.append(top1accuracy)
+    print(f"Linear Classifier Top-1 Accuracy: {sum(top1)/len(top1) * 100:.2f}%")
+    print(f"Linear Classifier Top-5 Accuracy: {sum(top5)/len(top5) * 100:.2f}%")

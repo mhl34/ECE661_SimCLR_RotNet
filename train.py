@@ -18,87 +18,79 @@ from torch.utils.data import DataLoader, SubsetRandomSampler
 from torch.utils.data.dataset import Dataset
 from torchsummary import summary
 import numpy as np
+from ResNet import ResNet
+from ContrastiveLoss import ContrastiveLoss
+from SimCLRDataset import SimCLRDataset
 from hyperParams import hyperParams
+from SimCLRModel import SimCLRModel
 import matplotlib.pyplot as plt
-from RotNetDataset import RotatedCIFAR10
-from RotNetLoss import RotNetLoss
-from RotNet import RotNet
+from utils import extract_features
 
-# Define data transformations
-transform = transforms.Compose([
-    transforms.ToTensor(),
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+# Initialize SimCLR Model
+hyperparams = hyperParams()
+base_encoder = torch.hub.load('pytorch/vision:v0.9.0', 'resnet50', pretrained=False).to(device)
+simclr_model = SimCLRModel(base_encoder, hyperparams.projection_dim)
+
+# Data Augmentation
+data_transform = transforms.Compose([
+    # transforms.Resize(224),
+    # transforms.ColorJitter(brightness=0.5, contrast=1, saturation=0.1, hue=0.5),
+    # transforms.GaussianBlur(kernel_size=(7, 13), sigma=(9, 11)),
+    transforms.ToTensor()
 ])
 
-# Create RotatedCIFAR10 dataset
-root = "./data"  # Change this to your desired data directory
-rotated_cifar_dataset = RotatedCIFAR10(root=root, transform=transform)
-
-# Create DataLoader
-hyperparams = hyperParams()
-torch.manual_seed(42)  # Set a seed for reproducibility
-
-indices = list(range(len(rotated_cifar_dataset)))
+# Initialize DataLoader and SimCLRDataset
+dataset = datasets.CIFAR10(root='./data', download=True, train=True, transform=data_transform)
+simclr_dataset = SimCLRDataset(dataset)
+indices = list(range(len(dataset)))
 subset_size = hyperparams.batch_size * 20
-shuffled_indices = torch.randperm(len(indices))
-subset_indices = indices[:subset_size]
-subset_sampler = SubsetRandomSampler(subset_indices)
 
-cifar_dataloader = DataLoader(rotated_cifar_dataset, batch_size=hyperparams.batch_size, sampler=subset_sampler)
-device = hyperparams.device
-
-# Example usage
-base_encoder = torch.hub.load('pytorch/vision:v0.9.0', 'resnet50', pretrained=False).to(device)
-base_encoder.fullyConnect = nn.Identity()  # Remove the final classification layer
-rotnet_model = RotNet(base_encoder, hyperparams.num_classes)
-rotnet_model.to(device)
-
-torch.nn.utils.clip_grad_norm_(base_encoder.parameters(), max_norm=1.0) 
-
-criterion = RotNetLoss()
-optimizer = optim.Adam(rotnet_model.parameters(), lr=hyperparams.learning_rate, weight_decay=hyperparams.weight_decay)
-
+# store the best loss
 best_loss = float('inf')
 
-rotnet_model.train()
+# Shuffle the indices randomly
+torch.manual_seed(42)  # Set a seed for reproducibility
+shuffled_indices = torch.randperm(len(indices))
 
-file = open("trainLosses.txt", "w")
+# Take a random subset of indices
+subset_indices = indices[:subset_size]
 
-# Example: forward pass
+# Use SubsetRandomSampler to create a DataLoader with the random subset
+subset_sampler = SubsetRandomSampler(subset_indices)
+dataloader = DataLoader(dataset=simclr_dataset, batch_size=hyperparams.batch_size, sampler=subset_sampler)
+
+criterion = ContrastiveLoss(hyperparams.temperature)
+optimizer = optim.Adam(simclr_model.parameters(), lr=hyperparams.learning_rate, weight_decay=hyperparams.weight_decay)
+
+# Training Loop
 for epoch in range(hyperparams.epochs):
-    progress_bar = tqdm(enumerate(cifar_dataloader), total=len(cifar_dataloader), desc=f'Epoch {epoch+1}', unit='batch')
-    
-    if epoch in [30, 60, 80]:
-        print(f"updating lr ... ")
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = param_group['lr'] * 1/5
+    progress_bar = tqdm(enumerate(dataloader), total=len(dataloader), desc=f'Epoch {epoch+1}', unit='batch')
 
     # Loop over batches
-    for batch_idx, batch in progress_bar:
-        rotated_image, rotated_label = batch
-        rotated_image = rotated_image.to(device)
-        rotated_image_norm = F.normalize(rotated_image)
-        rotated_label = rotated_label.to(device)
-        
-        rotnet_output = rotnet_model(rotated_image_norm)
-        rotnet_output = rotnet_output.to(device)
-        
-        loss = criterion(rotnet_output, rotated_label)
-        
+    for batch_idx, (img1, img2) in progress_bar:
+        # Forward pass
+        h1, z1 = simclr_model(img1.to(device))
+        h2, z2 = simclr_model(img2.to(device))
+
+        # Compute contrastive loss
+        loss = criterion(z1, z2)
+
         # Backward and optimize
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        
-        file.write(f"{loss.item()}\n")
-        
+
+        # file.write(f"{loss.item()}\n")
+
     if loss.item() < best_loss:
         print("Saving ...")
         # Save the learned representation for downstream tasks
-        state = {'state_dict': rotnet_model.state_dict(),
+        state = {'state_dict': simclr_model.state_dict(),
                  'epoch': epoch,
                  'lr': hyperparams.learning_rate}
-        torch.save(state, f'rotnet_encoder{hyperparams.batch_size}.pth')
+        torch.save(state, f'simclr_encoder{hyperparams.batch_size}_{hyperparams.epochs}.pth')
         best_loss = loss.item()
         
     print(f'Epoch [{epoch+1}/{hyperparams.epochs}], Train Loss: {loss.item():.4f}')
-        
